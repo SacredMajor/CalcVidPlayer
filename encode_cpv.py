@@ -1,342 +1,277 @@
 #!/usr/bin/env python3
 """
-encode_cpv.py – CinemaPlus multi-video encoder
-================================================
-Encodes one or more video files into a single VIDEO.CPV file for use with the
-CinemaPlus TI-84 Plus CE player.
+encode_cpv.py – CalcVidPlayer multi-video encoder
+===============================================
+Converts one or more MP4/MKV files into a single binary file that you
+dd directly onto your USB drive (same as Cinema).
 
 Requirements:
-    pip install ffmpeg-python Pillow numpy
+    pip install Pillow numpy
+
+FFmpeg must be installed and on your PATH.
 
 Usage:
-    python encode_cpv.py -o VIDEO.CPV \
-        --video "Bad Apple.mp4" "Bad Apple" 24 \
-        --video "Rick Roll.mp4" "Never Gonna" 24
+    # Single video (just like Cinema, but with a menu):
+    python encode_cpv.py -o output.bin video.mp4 "My Video" 10
 
-Each --video argument takes three values: <file> <title> <fps>.
-The title is truncated to 31 characters.
+    # Multiple videos:
+    python encode_cpv.py -o output.bin \\
+        jjk.mp4 "JJK Ep 42" 10 \\
+        avatar.mp4 "Avatar" 10
 
-The output file can be placed on any FAT32 USB drive.  No special partition
-layout is required; the encoder writes a self-contained file and the player
-reads it via fatdrvce's file API.
+Each video takes 3 arguments: <file> <title> <fps>
+Title is shown in the on-calculator menu (max 31 chars).
+fps of 10 is recommended (same as Cinema).
+
+Then write to USB:
+    sudo dd if=output.bin of=/dev/sdX bs=4M status=progress
 """
 
-import argparse
 import math
 import os
 import struct
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Constants (must match main.c) ──────────────────────────────────────────
 
-MAGIC            = b"CPVF"
-FORMAT_VERSION   = 1
-FRAME_WIDTH      = 160
-FRAME_HEIGHT     = 96
-PALETTE_BYTES    = 256 * 3          # 768
-PIXEL_BYTES      = FRAME_WIDTH * FRAME_HEIGHT  # 15 360
-FRAME_RAW_BYTES  = PALETTE_BYTES + PIXEL_BYTES  # 16 128
-SECTOR_SIZE      = 512
-FRAME_SECTORS    = math.ceil(FRAME_RAW_BYTES / SECTOR_SIZE)  # 32
-FRAME_PADDED     = FRAME_SECTORS * SECTOR_SIZE                # 16 384
+FRAME_WIDTH    = 160
+FRAME_HEIGHT   = 96
+PALETTE_BYTES  = 256 * 3           # 768  bytes
+PIXEL_BYTES    = FRAME_WIDTH * FRAME_HEIGHT  # 15360 bytes
+FRAME_RAW      = PALETTE_BYTES + PIXEL_BYTES # 16128 bytes
+SECTOR         = 512
+FRAME_SECTORS  = 32                # ceil(16128/512) = 32
+FRAME_PADDED   = FRAME_SECTORS * SECTOR      # 16384 bytes
 
-HEADER_SIZE      = 32
-INDEX_ENTRY_SIZE = 64
-TITLE_MAX        = 31   # +1 for null terminator = 32 bytes
+HEADER_SECTORS = 8                 # sectors 0-7 reserved for header+index
+HEADER_SIZE    = SECTOR            # header fits in 1 sector (512 bytes)
+ENTRY_SIZE     = 64                # bytes per index entry
+MAX_VIDEOS     = 16
+TITLE_MAX      = 31
 
 
-# ── Palette quantisation ───────────────────────────────────────────────────────
+# ── Palette quantisation (same quality as FBin) ────────────────────────────
 
 def quantise_frame(rgb_array):
     """
-    Given a (H, W, 3) uint8 numpy array, return:
-        palette  – bytes of length 768  (256 × R,G,B)
-        indices  – bytes of length H*W  (one byte per pixel)
-
-    Uses PIL's median-cut quantiser which produces a 256-colour palette.
+    rgb_array: H×W×3 numpy uint8 array
+    Returns (palette_bytes [768], index_bytes [H*W])
     """
     from PIL import Image
     img = Image.fromarray(rgb_array, "RGB")
     img_q = img.quantize(colors=256, method=Image.Quantize.MEDIANCUT, dither=0)
-    palette_raw = img_q.getpalette()           # list of 768 ints (R,G,B × 256)
-    palette_bytes = bytes(palette_raw[:768])
-    index_bytes   = bytes(img_q.tobytes())     # one byte per pixel, row-major
-    return palette_bytes, index_bytes
+    pal = bytes(img_q.getpalette()[:768])
+    idx = bytes(img_q.tobytes())
+    return pal, idx
 
 
-# ── FFmpeg frame extraction ────────────────────────────────────────────────────
+# ── FFmpeg frame iterator ──────────────────────────────────────────────────
 
-def iter_frames_ffmpeg(input_path: str, target_fps: float, width=160, height=96):
-    """
-    Yields raw RGB numpy arrays (H, W, 3) for each output frame.
-    Uses ffmpeg via subprocess to avoid loading the whole video into RAM.
-    """
+def iter_frames(path, fps):
+    """Yields raw (H,W,3) numpy uint8 arrays via ffmpeg pipe."""
     import numpy as np
-
     cmd = [
-        "ffmpeg",
-        "-i", input_path,
-        "-vf", f"fps={target_fps},scale={width}:{height}:flags=lanczos",
-        "-f", "rawvideo",
-        "-pix_fmt", "rgb24",
-        "-",
+        "ffmpeg", "-i", path,
+        "-vf", f"fps={fps},scale={FRAME_WIDTH}:{FRAME_HEIGHT}:flags=lanczos",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
     ]
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    frame_bytes = width * height * 3
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    nbytes = FRAME_WIDTH * FRAME_HEIGHT * 3
     try:
         while True:
-            raw = proc.stdout.read(frame_bytes)
-            if len(raw) < frame_bytes:
+            raw = proc.stdout.read(nbytes)
+            if len(raw) < nbytes:
                 break
-            yield np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 3))
+            yield np.frombuffer(raw, dtype=np.uint8).reshape((FRAME_HEIGHT, FRAME_WIDTH, 3))
     finally:
         proc.stdout.close()
         proc.wait()
 
 
-def count_frames_ffmpeg(input_path: str, target_fps: float, width=160, height=96) -> int:
-    """Quick pass to count total output frames (used for progress display)."""
-    cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-count_frames",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=nb_read_frames",
-        "-of", "default=nokey=1:noprint_wrappers=1",
-        "-vf", f"fps={target_fps},scale={width}:{height}",
-        input_path,
-    ]
+def count_frames(path, fps):
+    """Estimate frame count via ffprobe (used for progress display only)."""
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+        out = subprocess.check_output([
+            "ffprobe", "-v", "error", "-count_frames",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            "-vf", f"fps={fps},scale={FRAME_WIDTH}:{FRAME_HEIGHT}",
+            path,
+        ], stderr=subprocess.DEVNULL).decode().strip()
         return int(out)
     except Exception:
-        return 0  # unknown – progress bar will just not show totals
+        return 0
 
 
-# ── Frame writing ──────────────────────────────────────────────────────────────
+# ── Frame writer ───────────────────────────────────────────────────────────
 
-def write_frame(fout, palette_bytes: bytes, index_bytes: bytes):
-    """Write one padded frame (16 384 bytes) to the output file."""
-    raw = palette_bytes + index_bytes          # 16 128 bytes
-    padding = FRAME_PADDED - len(raw)          # 256 bytes of zero padding
+def write_frame(fout, pal, idx):
+    """Write one 16384-byte padded frame."""
+    raw = pal + idx
     fout.write(raw)
-    fout.write(b"\x00" * padding)
+    fout.write(b"\x00" * (FRAME_PADDED - len(raw)))
 
 
-# ── Header / index packing ─────────────────────────────────────────────────────
+# ── Pack header (512 bytes = 1 sector) ────────────────────────────────────
 
-def pack_header(num_videos: int) -> bytes:
-    """Pack the 32-byte file header."""
-    # data begins after header + index entries, rounded up to sector boundary
-    header_and_index = HEADER_SIZE + num_videos * INDEX_ENTRY_SIZE
-    sectors_for_meta = math.ceil(header_and_index / SECTOR_SIZE)
-    data_lba_start   = sectors_for_meta   # relative to file start (sector 0 = byte 0)
-
-    hdr = struct.pack(
-        "<4sHBBII16s",
-        MAGIC,
-        FORMAT_VERSION,
+def pack_header(num_videos):
+    # magic(4) version(1) num_videos(1) reserved0(2) data_lba_start(4) reserved(500)
+    hdr = struct.pack("<4sBBHI500s",
+        b"CPVF",
+        1,              # version
         num_videos,
-        0,                  # flags
-        HEADER_SIZE,        # index_offset (always 32)
-        data_lba_start,
-        b"\x00" * 16,       # reserved
+        0,              # reserved0
+        HEADER_SECTORS, # data_lba_start
+        b"\x00" * 500,
     )
-    assert len(hdr) == HEADER_SIZE
+    assert len(hdr) == SECTOR
     return hdr
 
 
-def pack_index_entry(title: str, lba_offset: int, num_frames: int,
-                     fps_num: int, fps_den: int, lba_count: int) -> bytes:
-    title_bytes = title.encode("utf-8")[:TITLE_MAX] + b"\x00"
-    title_bytes = title_bytes.ljust(32, b"\x00")
+# ── Pack index entry (64 bytes) ────────────────────────────────────────────
 
-    entry = struct.pack(
-        "<32sIIHHHH12s",
-        title_bytes,
+def pack_entry(title, lba_offset, num_frames, fps_num, fps_den):
+    t = title.encode()[:TITLE_MAX] + b"\x00"
+    t = t.ljust(TITLE_MAX + 1, b"\x00")
+    # title(32) + lba_offset(4) + num_frames(4) + fps_num(2) + fps_den(2) + reserved(20)
+    entry = struct.pack("<32sIIHH20s",
+        t,
         lba_offset,
         num_frames,
         fps_num,
         fps_den,
-        FRAME_WIDTH,
-        FRAME_HEIGHT,
-        lba_count,
-        b"\x00" * 12,
+        b"\x00" * 20,
     )
-    # struct gives 32+4+4+2+2+2+2+4+12 = 64 bytes – but the pack format above
-    # has lba_count as H (2 bytes) and reserved as 12s; let's recount:
-    # 32+4+4+2+2+2+2 = 48, then lba_count needs 4 bytes; fix:
-    assert len(entry) == INDEX_ENTRY_SIZE, f"Entry size {len(entry)} != {INDEX_ENTRY_SIZE}"
+    assert len(entry) == ENTRY_SIZE, f"entry is {len(entry)} bytes"
     return entry
 
 
-def _pack_index_entry_correct(title: str, lba_offset: int, num_frames: int,
-                               fps_num: int, fps_den: int, lba_count: int) -> bytes:
-    """Correctly sized 64-byte index entry."""
-    title_bytes = title.encode("utf-8")[:TITLE_MAX]
-    title_field = title_bytes + b"\x00" * (32 - len(title_bytes))
+# ── Main encode ────────────────────────────────────────────────────────────
 
-    body = struct.pack(
-        "<IIHHHI",
-        lba_offset,     # 4
-        num_frames,     # 4
-        fps_num,        # 2
-        fps_den,        # 2
-        FRAME_WIDTH,    # 2
-        FRAME_HEIGHT,   # 2  → subtotal body so far: 16
-        lba_count,      # 4  → 20
-    )
-    # title(32) + body(20) = 52; need 12 bytes reserved
-    entry = title_field + body + b"\x00" * 12
-    assert len(entry) == INDEX_ENTRY_SIZE, f"Bug: entry is {len(entry)} bytes"
-    return entry
+def encode(output_path, videos):
+    import tempfile
 
-
-# ── Main encode routine ────────────────────────────────────────────────────────
-
-def encode(output_path: str, videos: list[dict]):
-    """
-    videos: list of dicts with keys: path, title, fps
-    """
-    num_videos   = len(videos)
-    header_bytes = pack_header(num_videos)
-
-    # We'll write the header placeholder, then collect index entries as we go,
-    # then seek back to patch them in.  But since index entries need lba_offset
-    # (which depends on prior video sizes) we process sequentially.
-
-    # Calculate starting LBA for data (relative to byte 0 of file = LBA 0)
-    header_and_index_bytes = HEADER_SIZE + num_videos * INDEX_ENTRY_SIZE
-    meta_sectors = math.ceil(header_and_index_bytes / SECTOR_SIZE)
-    meta_bytes   = meta_sectors * SECTOR_SIZE
-
-    print(f"CinemaPlus Encoder v1.0")
-    print(f"Output     : {output_path}")
-    print(f"Videos     : {num_videos}")
-    print(f"Meta bytes : {meta_bytes} ({meta_sectors} sectors)")
+    n = len(videos)
+    print(f"CalcVidPlayer Encoder")
+    print(f"Output : {output_path}")
+    print(f"Videos : {n}")
     print()
 
-    index_entries  = []
-    current_lba    = 0   # LBA offset from data_lba_start
-
-    # First pass: encode each video to a temp file and record metadata
     temp_files = []
-    for i, vid in enumerate(videos):
-        title   = vid["title"]
-        fps     = vid["fps"]
+    entries = []
+    lba_cursor = 0  # lba_offset from data_lba_start
+
+    for i, (path, title, fps) in enumerate(videos):
         fps_num = int(fps * 1000)
         fps_den = 1000
-
-        print(f"[{i+1}/{num_videos}] Encoding '{title}' from {vid['path']} @ {fps} fps")
-        total = count_frames_ffmpeg(vid["path"], fps)
+        total = count_frames(path, fps)
+        print(f"[{i+1}/{n}] '{title}'  ({path})  @ {fps} fps")
         if total:
-            print(f"  Estimated frames: {total}")
+            print(f"  ~{total} frames")
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".fbin")
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".bin")
         temp_files.append(tmp.name)
         frame_count = 0
 
-        for frame_idx, rgb in enumerate(iter_frames_ffmpeg(vid["path"], fps)):
-            palette, indices = quantise_frame(rgb)
-            write_frame(tmp, palette, indices)
+        for rgb in iter_frames(path, fps):
+            pal, idx = quantise_frame(rgb)
+            write_frame(tmp, pal, idx)
             frame_count += 1
-            if frame_count % 50 == 0:
+            if frame_count % 100 == 0:
                 if total:
-                    pct = frame_count * 100 // total
-                    print(f"  {frame_count}/{total} frames ({pct}%)", end="\r")
+                    print(f"  {frame_count}/{total} ({frame_count*100//total}%)", end="\r")
                 else:
                     print(f"  {frame_count} frames", end="\r")
 
         tmp.flush()
         tmp.close()
+
         lba_count = frame_count * FRAME_SECTORS
+        print(f"  {frame_count} frames done ({lba_count} sectors)")
 
-        print(f"  {frame_count} frames encoded, {lba_count} sectors")
+        entries.append(pack_entry(title, lba_cursor, frame_count, fps_num, fps_den))
+        lba_cursor += lba_count
 
-        entry = _pack_index_entry_correct(
-            title, current_lba, frame_count, fps_num, fps_den, lba_count
-        )
-        index_entries.append(entry)
-        current_lba += lba_count
-
-    # Second pass: write final output file
+    # Write output file
     print(f"\nWriting {output_path} ...")
-    with open(output_path, "wb") as fout:
-        # Header
-        fout.write(header_bytes)
-        # Index entries
-        for entry in index_entries:
-            fout.write(entry)
-        # Pad to sector boundary
-        written = HEADER_SIZE + num_videos * INDEX_ENTRY_SIZE
-        pad = meta_bytes - written
-        fout.write(b"\x00" * pad)
+    with open(output_path, "wb") as f:
+        # Sector 0: header
+        f.write(pack_header(n))
+
+        # Sectors 1-7: index entries + padding
+        idx_data = b"".join(entries)
+        idx_padded = idx_data + b"\x00" * ((HEADER_SECTORS - 1) * SECTOR - len(idx_data))
+        f.write(idx_padded)
+
         # Video data
         for i, tmp_path in enumerate(temp_files):
-            print(f"  Appending video {i+1}/{num_videos} ...")
+            print(f"  Appending video {i+1}/{n} ...")
             with open(tmp_path, "rb") as fin:
                 while True:
-                    chunk = fin.read(65536)
+                    chunk = fin.read(1 << 16)
                     if not chunk:
                         break
-                    fout.write(chunk)
+                    f.write(chunk)
             os.unlink(tmp_path)
 
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"\nDone!  {output_path}  ({size_mb:.1f} MB)")
+    mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"\nDone!  {output_path}  ({mb:.1f} MB)")
+    print()
+    print("Write to USB:")
+    print(f"  sudo dd if={output_path} of=/dev/sdX bs=4M status=progress")
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
-
-class VideoAction(argparse.Action):
-    """Collect --video FILE TITLE FPS triples."""
-    def __call__(self, parser, namespace, values, option_string=None):
-        if len(values) != 3:
-            parser.error("--video requires exactly 3 arguments: FILE TITLE FPS")
-        lst = getattr(namespace, self.dest, None) or []
-        try:
-            fps = float(values[2])
-        except ValueError:
-            parser.error(f"FPS must be a number, got: {values[2]}")
-        lst.append({"path": values[0], "title": values[1], "fps": fps})
-        setattr(namespace, self.dest, lst)
-
+# ── CLI ────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Encode videos into a CinemaPlus multi-video .cpv file",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument("-o", "--output", default="VIDEO.CPV",
-                        help="Output file (default: VIDEO.CPV)")
-    parser.add_argument("--video", dest="videos", nargs=3,
-                        metavar=("FILE", "TITLE", "FPS"),
-                        action=VideoAction,
-                        help="Add a video. Can be repeated.",
-                        required=True)
+    args = sys.argv[1:]
 
-    args = parser.parse_args()
+    if "-h" in args or "--help" in args or not args:
+        print(__doc__)
+        sys.exit(0)
 
-    if not args.videos:
-        parser.error("At least one --video is required")
+    output = "output.bin"
+    if args[0] in ("-o", "--output"):
+        output = args[1]
+        args = args[2:]
 
-    for v in args.videos:
-        if not Path(v["path"]).exists():
-            sys.exit(f"File not found: {v['path']}")
-        if not (1 <= v["fps"] <= 60):
-            sys.exit(f"FPS out of range (1–60): {v['fps']}")
-        if len(v["title"]) > TITLE_MAX:
-            print(f"Warning: title '{v['title']}' truncated to {TITLE_MAX} chars")
+    if len(args) % 3 != 0:
+        sys.exit("Error: provide videos as triples: <file> <title> <fps>")
 
-    encode(args.output, args.videos)
+    videos = []
+    for i in range(0, len(args), 3):
+        path  = args[i]
+        title = args[i+1]
+        try:
+            fps = float(args[i+2])
+        except ValueError:
+            sys.exit(f"FPS must be a number, got: {args[i+2]}")
+
+        if not Path(path).exists():
+            sys.exit(f"File not found: {path}")
+        if len(videos) >= MAX_VIDEOS:
+            sys.exit(f"Maximum {MAX_VIDEOS} videos supported")
+
+        if len(title) > TITLE_MAX:
+            print(f"Warning: title truncated to {TITLE_MAX} chars")
+            title = title[:TITLE_MAX]
+
+        videos.append((path, title, fps))
+
+    if not videos:
+        sys.exit("No videos specified.")
+
+    # Check dependencies
+    try:
+        import numpy
+        from PIL import Image
+    except ImportError:
+        sys.exit("Missing dependencies. Run: pip install Pillow numpy")
+
+    encode(output, videos)
 
 
 if __name__ == "__main__":
